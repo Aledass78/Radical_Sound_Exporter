@@ -1,0 +1,167 @@
+# Radical Sound Exporter  v4
+
+Extracts, previews, and exports audio from Prototype 2 `.p3d` files.  
+Supports PC (little-endian) and PS3 (big-endian) files.
+
+---
+
+## Requirements
+
+- Python 3.10 or newer
+- `tkinter` (included with standard Python on Windows)
+- `winsound` (Windows only — built into the standard library)
+
+No external packages required.
+
+---
+
+## Running
+
+```
+python sound_exporter.py
+```
+
+Or double-click `sound_exporter.py` if `.py` files are associated with Python.
+
+---
+
+## What it reads
+
+The tool parses **0xFE000000 (FileObjectTable)** chunks inside `.p3d` files.  
+Each chunk stores one named audio or config object.
+
+---
+
+## Treeview color coding
+
+Each row in the list uses a distinct color to identify the type at a glance:
+
+| Color | Type | Description |
+|-------|------|-------------|
+| Blue on light blue | **RADP ADPCM** | IMA-ADPCM audio (mono or multi-channel) |
+| Green on light green | **PCM WAV** | Uncompressed 16-bit PCM audio |
+| Purple on lavender | **MP3** | MPEG-1 audio (PS3 files only) |
+| Orange-brown | **BasicSoundII** | 3D positional one-shot sound cue |
+| Teal | **DualDistanceSound** | Close/distant blend sound |
+| Olive | **PhysicsSound3Voice** | Physics impact, 3-voice polyphony |
+| Gold | **PhysicsSoundLoop** | Speed-driven looping sound |
+| Pink | **RandomSound** | Random clip picker |
+| Brick red | **TankSound** | Vehicle engine (RPM-driven) |
+| Deep blue | **AmbienceSound2 / BaseAmbienceSound / LairAmbienceSound** | Ambient background loop |
+| Navy | **SubsonicSound** | LFE / subwoofer effect |
+| Khaki | **AmbientVehicleSound** | Background traffic vehicle |
+| Warm gold | **Sequence** | Adaptive music state machine |
+| Tan | **MaterialMap** | Surface → footstep sound mapping |
+| Slate | **ReverbSetting / CompLimitSetting** | DSP / mix configuration |
+| Light gray | **Mixer / SideChain / AudioMemoryBudget** | Global audio system config |
+| Mid gray | **AudioSoundGroups / DialogueSoundGroups / FrontendSounds / GasMaskSound** | Routing / registry data |
+
+---
+
+## Controls
+
+| Action | How |
+|--------|-----|
+| Open file | Click **Open P3D…** or press **Ctrl+O** |
+| Play raw audio | Select a row and click **Play**, or double-click / press Enter |
+| Stop playback | Click **Stop** |
+| Export one track | Select a row and click **Export…** |
+| Export all audio | Click **Export All…** (exports all playable tracks to a folder) |
+
+---
+
+## Config panel
+
+Selecting any config entry (non-raw-audio row) opens the **Config Details** panel below the list.
+
+### Audio references section
+
+Lists every AudioFile that this config object references, with a role label:
+
+| Role label | Meaning |
+|------------|---------|
+| *(blank)* | Generic audio reference (BasicSoundII, ambience types, LFE) |
+| `[Close]` | Close-range clip (DualDistanceSound) |
+| `[Dist]` | Distant clip (DualDistanceSound) |
+| `[Voice]` | One polyphony voice (PhysicsSound3Voice) |
+| `[Pick]` | One random choice (RandomSound) |
+| `[Move]` | Engine loop (TankSound) |
+| `[Start]` | Engine startup (TankSound, AmbientVehicleSound) |
+| `[Stop]` | Engine stop (TankSound) |
+| `[Treads]` | Tread/tracks sound (TankSound) |
+| `[Ambi]` | Ambient idle sound (TankSound) |
+| `[Engine]` | Engine loop (AmbientVehicleSound) |
+| `[Passby]` | Doppler passby clip (AmbientVehicleSound) |
+| `[Music]` | Music track (Sequence) |
+
+Click **→ Go to** next to any reference to jump to that AudioFile in the list (if it exists in the same `.p3d` file).
+
+> Audio references may point to AudioFiles in a different `.p3d` file. In that case "→ Go to" will show "not found in this file" in the status bar.
+
+### Parameters section
+
+Shows sliders for the numeric parameters read from the binary payload:
+
+| Type | Sliders |
+|------|---------|
+| BasicSoundII | Volume, Pitch Low, Pitch High, Near Dist, Far Dist |
+| DualDistanceSound | Distance (simulated listener distance), Crossover |
+| PhysicsSound3Voice | Velocity, Vol Scale |
+| PhysicsSoundLoop | Speed, Vol Scale, Max Vol, Min Pitch, Max Pitch |
+| RandomSound | *(none)* |
+| TankSound | RPM, Base Pitch, Idle Vol |
+| All other config types | *(none)* |
+
+### Content section (metadata types)
+
+For types that contain lookup tables or configuration text rather than audio references, the panel shows a scrollable content view:
+
+| Type | Content shown |
+|------|--------------|
+| MaterialMap | Surface material name → footstep AudioFile name |
+| FrontendSounds | UI event name → AudioFile name (first 24 pairs) |
+| AudioDialogueSubtitle | Per-language subtitle text |
+| AudioSoundGroups | All sound group category names |
+| DialogueSoundGroups | All dialogue routing group names |
+| AudioMemoryBudget | Category names with budget in KB |
+| ReverbSetting | Reverb preset name |
+| CompLimitSetting | Mode (Stereo/Surround) and compressor float parameters |
+| GasMaskSound | VO filter description |
+| Mixer | Mix bus names (first 20 of ~200+) |
+| SideChain | Chain name |
+
+### Simulate Play button
+
+Appears for config types that have audio references. Plays the referenced audio with the current slider values applied:
+
+| Type | Simulation behavior |
+|------|---------------------|
+| BasicSoundII | Plays the audio ref with volume scaled and pitch randomized between PitchLow and PitchHigh |
+| DualDistanceSound | Picks close or distant pool based on Distance vs Crossover; picks randomly within the pool |
+| PhysicsSound3Voice | Scales volume by `Velocity × VolScale`, picks one of the 3 voices at random |
+| PhysicsSoundLoop | Derives volume and pitch from Speed using the binary-read parameters |
+| RandomSound | Picks one choice at random; cascades into a sub-config if needed |
+| TankSound | Derives pitch = base_pitch + (RPM/maxRPM)×0.6 and volume = lerp(idleVol, 1.0, RPM/maxRPM) |
+| AmbienceSound2 / BaseAmbienceSound / LairAmbienceSound | Plays the referenced multi-channel ADPCM (downmixed to mono) at volume 1.0 |
+| SubsonicSound | Plays the LFE clip at volume 1.0 |
+| AmbientVehicleSound | Plays the engine loop clip |
+| Sequence | Plays the first music track that can be found in the current file |
+
+> Multi-channel ADPCM (3+ch) is downmixed to mono for playback because Windows `winsound` only supports 1- or 2-channel WAV. The exported file retains the original channel count.
+
+---
+
+## Export
+
+- **Export…** saves the selected track: ADPCM → `.wav` (full multi-channel), PCM → `.wav`, MP3 → `.mp3`
+- **Export All…** saves all playable tracks in the file to a chosen folder, naming them by their object name
+- Config entries (non-audio rows) cannot be exported — they contain no raw audio data
+
+---
+
+## Known limitations
+
+- Playback requires Windows (`winsound`). The parser and exporter work on any OS.
+- Music Sequence tracks typically reside in a different `.p3d` file than the Sequence config itself. "Simulate Play" for Sequence will report "not in this file" unless you open a file that contains both.
+- The binary layout of the Sequence state-machine transition table is not fully decoded. Audio track references are extracted but the full state logic is not simulated.
+- Mixer, SideChain, and ReverbSetting are read-only display — their parameters are not applied to playback.
