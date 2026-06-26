@@ -1,7 +1,8 @@
 <sub>It is a fork of RockerLol's project, as it is based on his ideas in <a href="https://github.com/RockeyLol/Prototype-RADP-Conv-v1.0">Prototype-RADP-Conv-v1.0</a></sub>
 # Radical Sound Exporter  v4
 
-Extracts, Imports, previews, and exports audio from Prototype 2 `.p3d` files.  
+Extracts, previews, exports, and imports audio in Prototype 2 `.p3d` files.
+Can also create new AudioFile chunks and inject them into an existing `.p3d`.  
 Supports PC (little-endian) and maybe support PS3 (big-endian) files.
 
 ---
@@ -68,6 +69,8 @@ Each row in the list uses a distinct color to identify the type at a glance:
 | Stop playback | Click **Stop** |
 | Export one track | Select a row and click **Export…** |
 | Export all audio | Click **Export All…** (exports all playable tracks to a folder) |
+| Import sound | Click **Import…** to replace or add an AudioFile chunk from a `.wav` or `.mp3` file |
+| Create new chunk | Click **New Chunk…** to create a new AudioFile chunk and inject it into the open `.p3d` |
 
 ---
 
@@ -98,6 +101,28 @@ Lists every AudioFile that this config object references, with a role label:
 Click **→ Go to** next to any reference to jump to that AudioFile in the list (if it exists in the same `.p3d` file).
 
 > Audio references may point to AudioFiles in a different `.p3d` file. In that case "→ Go to" will show "not found in this file" in the status bar.
+
+### Radical UIDs section
+
+For config classes the panel shows a **Radical UIDs** frame containing every
+known Radical UID found in the chunk payload. UIDs are computed by the engine's
+`MakeUID` hash (`h = 0; for each char c: h = h*65599 ^ c`) and stored
+little-endian regardless of platform.
+
+| Label | Meaning |
+|-------|---------|
+| `classUID` | 8-byte class-version hash unique to each config type. Constant across all instances of that class. |
+| `uid_schema[surround]` | Schema UID of the "surround" routing property (originating string unknown). |
+| `uid["surround"]` | `MakeUID("surround")` = `0xBD37972B64167C6E` — the routing bus target. |
+| `uid_schema[snd_grps]` | Schema UID of the "sound_groups" routing property (originating string unknown). |
+| `uid["sound_groups"]` | `MakeUID("sound_groups")` = `0xE245EC93C2FB08B0` — the priority/category target. |
+| `uid["Points"]` | `MakeUID("Points")` = `0xAD09A14708D74011` — property tag for data-point arrays (velocity curves, clip lists). |
+
+Only UIDs that are actually present in the chunk are shown. Raw AudioFile
+chunks (ADPCM/WAV/MP3) never have this section — UIDs only appear in config
+class payloads.
+
+To know more about Radical's UIDs, Check UID Dehasher.
 
 ### Parameters section
 
@@ -149,6 +174,19 @@ Appears for config types that have audio references. Plays the referenced audio 
 | Sequence | Plays the first music track that can be found in the current file |
 
 > Multi-channel ADPCM (3+ch) is downmixed to mono for playback because Windows `winsound` only supports 1- or 2-channel WAV. The exported file retains the original channel count.
+
+---
+
+## Import
+
+- **Import…** replaces the selected AudioFile chunk's audio data with a new sound file (`.wav` or `.mp3`). The chunk's object name is preserved; only the raw audio payload is swapped. The modified `.p3d` is saved in place.
+- Imported `.wav` files are re-encoded as Radical IMA-ADPCM (RADP). Imported `.mp3` files are stored as-is.
+
+---
+
+## New Chunk
+
+- **New Chunk…** creates a brand-new AudioFile chunk from a sound file and injects it into the currently open `.p3d`. You supply the object name that other config chunks (e.g. BasicSoundII) will reference by name. The new chunk appears in the treeview immediately after injection.
 
 ---
 

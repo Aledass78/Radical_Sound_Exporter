@@ -417,9 +417,74 @@ def _find_payload_strs(payload):
     return result
 
 
-# Marker GUID that follows the close-clips in every DualDistanceSound payload.
-# Confirmed present in all 4 DualDistanceSound entries in the reference file.
-_DUAL_CLOSE_MARKER = bytes.fromhex('1140d70847a109ad')
+# ── Radical UID constants (MakeUID: h=0; for c in s: h=h*65599^c) ──────────
+# UIDs are stored little-endian in the payload regardless of platform.
+#
+# Confirmed via MakeUID reverse lookup:
+#   MakeUID("surround")     = 0xBD37972B64167C6E
+#   MakeUID("sound_groups") = 0xE245EC93C2FB08B0
+#   MakeUID("Points")       = 0xAD09A14708D74011
+#
+# "Points" UID: property tag for an array of data points.
+#   In DualDistanceSound: separates close clips from distant clips.
+#   In TankSound / PhysicsSoundLoop / AmbientVehicleSound: precedes each
+#   velocity-curve sub-block (array of velocity->volume coordinate pairs).
+_UID_POINTS = bytes.fromhex('1140d70847a109ad')   # MakeUID("Points")
+
+# Keep old name as alias so existing _parse_config_refs code still works.
+_DUAL_CLOSE_MARKER = _UID_POINTS
+
+# 16-byte UID pairs embedded in every playable config class:
+_UID_PAIR_SURROUND    = bytes.fromhex('914F0D37E5CA4B80' '6E7C16642B9737BD')
+_UID_PAIR_SOUNDGROUPS = bytes.fromhex('F7A4D796A29CECC3' 'B008FBC293EC45E2')
+
+# Classes that begin their payload with a classUID (8-byte class-version hash)
+_CLASSES_WITH_CLASS_UID = frozenset({
+    'BasicSoundII', 'DualDistanceSound', 'PhysicsSound3Voice',
+    'PhysicsSoundLoop', 'RandomSound', 'TankSound',
+    'AmbientVehicleSound', 'SubsonicSound', 'HelicopterSound',
+    'GrainSound', 'GasMaskSound', 'AudioDialogueSubtitle',
+})
+
+
+def _extract_payload_uids(data, class_name, be):
+    """
+    Return list of (label, '0xHHHH...') for every known Radical UID
+    found in the chunk payload.  UIDs are stored LE regardless of platform.
+    """
+    results = []
+    payload = data[_skip_strtable(data, be):]
+    if len(payload) < 8:
+        return results
+
+    # classUID — first 8 payload bytes; unique per class type
+    if class_name in _CLASSES_WITH_CLASS_UID:
+        v = struct.unpack_from('<Q', payload, 0)[0]
+        results.append(('classUID', f'0x{v:016X}'))
+
+    # UID pair for routing property "surround"
+    pos = payload.find(_UID_PAIR_SURROUND)
+    if pos != -1:
+        schema = struct.unpack_from('<Q', payload, pos)[0]
+        name   = struct.unpack_from('<Q', payload, pos + 8)[0]
+        results.append(('uid_schema[surround]', f'0x{schema:016X}'))
+        results.append(('uid["surround"]',      f'0x{name:016X}'))
+
+    # UID pair for routing property "sound_groups"
+    pos = payload.find(_UID_PAIR_SOUNDGROUPS)
+    if pos != -1:
+        schema = struct.unpack_from('<Q', payload, pos)[0]
+        name   = struct.unpack_from('<Q', payload, pos + 8)[0]
+        results.append(('uid_schema[snd_grps]', f'0x{schema:016X}'))
+        results.append(('uid["sound_groups"]',   f'0x{name:016X}'))
+
+    # MakeUID("Points") — property tag for data-point arrays
+    pos = payload.find(_UID_POINTS)
+    if pos != -1:
+        v = struct.unpack_from('<Q', payload, pos)[0]
+        results.append(('uid["Points"]', f'0x{v:016X}'))
+
+    return results
 
 
 _METADATA_ONLY_CLASSES = frozenset({
@@ -1952,6 +2017,26 @@ class App(tk.Tk):
                     self._on_param_change(t, p)
                 for _pv in self._slider_vars.values():
                     _pv.trace_add('write', _param_trace)
+
+        # ── Radical UIDs section ──
+        uid_items = _extract_payload_uids(track.chunk_own, cls, self._be)
+        if uid_items:
+            uid_lf = tk.LabelFrame(self._cfg_panel, text=" Radical UIDs ",
+                                   bg=_COL_BG, font=('Segoe UI', 8))
+            uid_lf.pack(fill='x', padx=4, pady=(2, 2))
+            uid_grid = tk.Frame(uid_lf, bg=_COL_BG)
+            uid_grid.pack(fill='x', padx=6, pady=3)
+            for row_i, (lbl, hex_str) in enumerate(uid_items):
+                tk.Label(uid_grid, text=lbl, bg=_COL_BG, fg='#556677',
+                         font=('Consolas', 8), anchor='e', width=22,
+                         ).grid(row=row_i, column=0, sticky='e', padx=(0, 6), pady=1)
+                sv = tk.StringVar(value=hex_str)
+                e = tk.Entry(uid_grid, textvariable=sv, state='readonly',
+                             readonlybackground='#F0F0FA', fg='#1A1A6A',
+                             font=('Consolas', 8), relief='flat', bd=1,
+                             highlightthickness=1, highlightbackground='#CCCCDD',
+                             width=20)
+                e.grid(row=row_i, column=1, sticky='w', pady=1)
 
         # ── Content section (metadata-only types) ──
         if track.config_display:
