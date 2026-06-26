@@ -1916,16 +1916,34 @@ class App(tk.Tk):
                                orient='horizontal', length=160)
                 sl.grid(row=row_i, column=1, padx=2, pady=2)
 
-                val_lbl = tk.Label(slider_lf, textvariable=var,
-                                   bg=_COL_BG, fg='#333344',
-                                   font=('Consolas', 8), width=7, anchor='w')
-                # Show formatted value
-                def _fmt_trace(*_, v=var, wl=val_lbl):
-                    try: wl.config(text=f"{v.get():.3g}")
-                    except: pass
+                entry_sv = tk.StringVar(value=f"{cur_val:.4g}")
+                entry = tk.Entry(slider_lf, textvariable=entry_sv,
+                                 bg='#FFFFFF', fg='#222233',
+                                 font=('Consolas', 8), width=8,
+                                 relief='solid', bd=1)
+                entry.grid(row=row_i, column=2, padx=(2, 4), pady=2)
+
+                def _fmt_trace(*_, v=var, sv=entry_sv, e=entry):
+                    try:
+                        if e.focus_get() is not e:
+                            sv.set(f"{v.get():.4g}")
+                    except Exception:
+                        pass
                 var.trace_add('write', _fmt_trace)
-                _fmt_trace()
-                val_lbl.grid(row=row_i, column=2, padx=(2, 4), pady=2)
+
+                def _commit_entry(event=None, v=var, sv=entry_sv, mn2=mn, mx2=mx, e=entry):
+                    txt = sv.get().strip().replace(',', '.')
+                    try:
+                        val = float(txt)
+                        val = max(mn2, min(mx2, val))
+                        v.set(val)
+                        e.config(bg='#FFFFFF')
+                    except ValueError:
+                        e.config(bg='#FFCCCC')
+                        sv.set(f"{v.get():.4g}")
+                entry.bind('<Return>',   _commit_entry)
+                entry.bind('<KP_Enter>', _commit_entry)
+                entry.bind('<FocusOut>', _commit_entry)
 
             # For writable classes, add traces so slider moves save back to binary
             if track.config_class in _PARAM_WRITABLE_CLASSES and self._raw:

@@ -1,7 +1,8 @@
+<sub>It is a fork of RockerLol's project, as it is based on his ideas in <a href="https://github.com/RockeyLol/Prototype-RADP-Conv-v1.0">Prototype-RADP-Conv-v1.0</a></sub>
 # Radical Sound Exporter  v4
 
-Extracts, previews, and exports audio from Prototype 2 `.p3d` files.  
-Supports PC (little-endian) and PS3 (big-endian) files.
+Extracts, Imports, previews, and exports audio from Prototype 2 `.p3d` files.  
+Supports PC (little-endian) and maybe support PS3 (big-endian) files.
 
 ---
 
@@ -165,3 +166,4 @@ Appears for config types that have audio references. Plays the referenced audio 
 - Music Sequence tracks typically reside in a different `.p3d` file than the Sequence config itself. "Simulate Play" for Sequence will report "not in this file" unless you open a file that contains both.
 - The binary layout of the Sequence state-machine transition table is not fully decoded. Audio track references are extracted but the full state logic is not simulated.
 - Mixer, SideChain, and ReverbSetting are read-only display — their parameters are not applied to playback.
+- Programm loop & Sound Playing logic are in the same thread which is a well known issue.
