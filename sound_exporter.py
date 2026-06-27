@@ -1,5 +1,5 @@
 """
-Radical Sound Exporter  (v4)
+Radical Sound Exporter  (v5)
 Extracts and plays audio embedded in Prototype 2 .p3d files.
 Supports PC/LE and PS3/BE. Includes Russian-version P3D types.
 
@@ -25,9 +25,14 @@ Supports PC/LE and PS3/BE. Includes Russian-version P3D types.
 15  AmbientVehicleSound —  background vehicle (engine/startup/passby)
 16  Sequence            —  adaptive music state machine
 
+0xFE000000 chunk types — dialogue (view & redact)
+──────────────────────────────────────────────────────────────────
+17  AudioDialogueSequence    —  scripted scene: personality → AudioFile map
+18  AudioDialoguePersonality —  NPC voice archetype: condition → bus/mode pool
+
 0xFE000000 chunk types — metadata (display only)
 ──────────────────────────────────────────────────────────────────
-17  MaterialMap         —  surface material ->footstep sound mapping
+19  MaterialMap         —  surface material ->footstep sound mapping
 18  ReverbSetting       —  RADverb preset name
 19  CompLimitSetting    —  compressor/limiter parameters
 20  AudioDialogueSubtitle — per-language subtitle text
@@ -402,6 +407,21 @@ def _skip_strtable(data, be):
     return off
 
 
+def _lpstr_read(data: bytes, pos: int):
+    """Read u32-len-prefixed string at exact pos. Returns (str_or_None, new_pos)."""
+    if pos + 4 > len(data):
+        return None, pos
+    n = struct.unpack_from('<I', data, pos)[0]
+    pos += 4
+    if n == 0 or n > 4096 or pos + n + 1 > len(data):
+        return None, pos
+    try:
+        s = data[pos:pos+n].decode('utf-8', errors='replace')
+    except Exception:
+        s = '?'
+    return s, pos + n + 1
+
+
 def _find_payload_strs(payload):
     """Scan payload for len-prefixed ASCII strings. Returns [(byte_offset, string)]."""
     result, o = [], 0
@@ -487,10 +507,176 @@ def _extract_payload_uids(data, class_name, be):
     return results
 
 
+# ── Dialogue chunk parsers ───────────────────────────────────────────────────
+
+def _parse_dialogue_sequence_data(data: bytes, be: bool) -> dict:
+    """Parse AudioDialogueSequence chunk own data. Returns structured dict."""
+    strtable_end = _skip_strtable(data, be)
+    p = data[strtable_end:]
+    result = {
+        'strtable_end': strtable_end,
+        'scene_name':   '',
+        'header_hash':  p[:4] if len(p) >= 4 else b'\x00\x00\x00\x00',
+        'bus_name':     '',
+        'field_val':    0,
+        'entries':      [],
+    }
+    for gname, items in _read_string_table(data, be):
+        if items:
+            result['scene_name'] = items[0]
+            break
+    pos = 4
+    if pos >= len(p) or p[pos] != 0x01:
+        return result
+    pos += 1
+    bus_name, pos = _lpstr_read(p, pos)
+    result['bus_name'] = bus_name or ''
+    if pos + 8 > len(p):
+        return result
+    result['field_val'] = struct.unpack_from('<I', p, pos)[0]; pos += 4
+    entry_count = struct.unpack_from('<I', p, pos)[0]; pos += 4
+    if entry_count > 10000:
+        return result
+    entries = []
+    for _ in range(entry_count):
+        if pos + 9 > len(p): break
+        pers_uid = p[pos:pos+8]; pos += 8
+        if pos >= len(p) or p[pos] != 0x01: break
+        pos += 1
+        pers_name, pos = _lpstr_read(p, pos)
+        if pers_name is None: break
+        if pos + 9 > len(p): break
+        af_uid = p[pos:pos+8]; pos += 8
+        if pos >= len(p) or p[pos] != 0x01: break
+        pos += 1
+        af_name, pos = _lpstr_read(p, pos)
+        if af_name is None: break
+        if pos + 4 > len(p): break
+        term = p[pos:pos+4]; pos += 4
+        entries.append({
+            'pers_uid': pers_uid,  'pers_name': pers_name or '?',
+            'af_uid':   af_uid,    'af_name':   af_name   or '?',
+            'term':     term,
+        })
+    result['entries'] = entries
+    return result
+
+
+def _parse_dialogue_personality_data(data: bytes, be: bool) -> dict:
+    """Parse AudioDialoguePersonality chunk own data. Returns structured dict."""
+    strtable_end = _skip_strtable(data, be)
+    p = data[strtable_end:]
+    result = {
+        'strtable_end': strtable_end,
+        'header_hash':  p[:4] if len(p) >= 4 else b'\x00\x00\x00\x00',
+        'own_name':     '',
+        'entries':      [],
+    }
+    pos = 4
+    if pos >= len(p) or p[pos] != 0x01:
+        return result
+    pos += 1
+    own_name, pos = _lpstr_read(p, pos)
+    result['own_name'] = own_name or ''
+    if pos + 4 > len(p):
+        return result
+    entry_count = struct.unpack_from('<I', p, pos)[0]; pos += 4
+    if entry_count > 1000:
+        return result
+    entries = []
+    for _ in range(entry_count):
+        if pos + 9 > len(p): break
+        cond_uid = p[pos:pos+8]; pos += 8
+        if pos >= len(p) or p[pos] != 0x01: break
+        pos += 1
+        cond, pos = _lpstr_read(p, pos)
+        if cond is None: break
+        if pos + 9 > len(p): break
+        bus_uid = p[pos:pos+8]; pos += 8
+        if pos >= len(p) or p[pos] != 0x01: break
+        pos += 1
+        bus, pos = _lpstr_read(p, pos)
+        if bus is None: break
+        if pos + 9 > len(p): break
+        mode_uid = p[pos:pos+8]; pos += 8
+        if pos >= len(p) or p[pos] != 0x01: break
+        pos += 1
+        mode, pos = _lpstr_read(p, pos)
+        if mode is None: break
+        # Scan forward for next entry boundary (8 bytes + 0x01 + valid ASCII lpstr)
+        config_start = pos
+        found_next = False
+        scan = pos
+        while scan + 13 <= len(p):
+            if p[scan + 8] == 0x01:
+                maybe_len = struct.unpack_from('<I', p, scan + 9)[0]
+                if 1 <= maybe_len <= 256 and scan + 13 + maybe_len <= len(p):
+                    if all(0x20 <= b < 0x7F for b in p[scan+13:scan+13+maybe_len]):
+                        pos = scan
+                        found_next = True
+                        break
+            scan += 1
+        entries.append({
+            'cond':       cond  or '?',
+            'bus':        bus   or '?',
+            'mode':       mode  or '?',
+            'cond_uid':   cond_uid,
+            'bus_uid':    bus_uid,
+            'mode_uid':   mode_uid,
+            'config_bytes': p[config_start:pos],
+        })
+        if not found_next:
+            break
+    result['entries'] = entries
+    return result
+
+
+def _rebuild_dialogue_sequence_chunk(orig_data: bytes, be: bool,
+                                      new_bus: str, new_entries: list) -> bytes:
+    """Rebuild AudioDialogueSequence chunk own data with a new bus and/or entry af_names."""
+    dd = _parse_dialogue_sequence_data(orig_data, be)
+
+    def pack_lpstr(s: str) -> bytes:
+        enc = s.encode('utf-8')
+        return struct.pack('<I', len(enc)) + enc + b'\x00'
+
+    payload = bytearray()
+    payload += dd['header_hash']
+    payload += b'\x01'
+    payload += pack_lpstr(new_bus)
+    payload += struct.pack('<I', dd['field_val'])
+    payload += struct.pack('<I', len(new_entries))
+    for e in new_entries:
+        payload += e['pers_uid']
+        payload += b'\x01'
+        payload += pack_lpstr(e['pers_name'])
+        payload += e['af_uid']
+        payload += b'\x01'
+        payload += pack_lpstr(e['af_name'])
+        payload += e['term']
+    return orig_data[:dd['strtable_end']] + bytes(payload)
+
+
+def _rebuild_dialogue_personality_name(orig_data: bytes, be: bool, new_own_name: str) -> bytes:
+    """Rebuild AudioDialoguePersonality chunk own data with a new personality name."""
+    dd = _parse_dialogue_personality_data(orig_data, be)
+    strtable_end = dd['strtable_end']
+    p = orig_data[strtable_end:]
+    if len(p) < 6 or p[4] != 0x01:
+        return orig_data
+    # p[0:4]=hash, p[4]=0x01, p[5:9]=u32 name len, p[9:9+old_len]=name, p[9+old_len]=null
+    old_len = struct.unpack_from('<I', p, 5)[0]
+    old_end = 5 + 4 + old_len + 1
+    enc = new_own_name.encode('utf-8')
+    new_p = p[:5] + struct.pack('<I', len(enc)) + enc + b'\x00' + p[old_end:]
+    return orig_data[:strtable_end] + new_p
+
+
 _METADATA_ONLY_CLASSES = frozenset({
     'MaterialMap', 'ReverbSetting', 'CompLimitSetting', 'AudioDialogueSubtitle',
     'AudioMemoryBudget', 'AudioSoundGroups', 'DialogueSoundGroups', 'FrontendSounds',
     'GasMaskSound', 'Mixer', 'SideChain',
+    'AudioDialogueSequence', 'AudioDialoguePersonality',
 })
 
 
@@ -646,40 +832,103 @@ def _parse_config_params(data, class_name, be):
         }
 
     elif class_name == 'PhysicsSoundLoop':
-        # payload[8]=min_speed, [12]=vol_scale, [16]=max_vol, [20]=speed_at_max, [24]=min_pitch, [52]=max_pitch
-        vol_sc  = f32(12); vol_sc  = vol_sc  if 0.001 <= vol_sc  <= 5.0   else 0.25
-        max_vol = f32(16); max_vol = max_vol if 0.01  <= max_vol <= 1.0   else 1.0
-        sp_max  = f32(20); sp_max  = sp_max  if 0.1   <= sp_max  <= 1000.0 else 10.0
-        min_p   = f32(24); min_p   = min_p   if 0.01  <= min_p   <= 2.0   else 0.32
-        max_p   = f32(52); max_p   = max_p   if 0.01  <= max_p   <= 4.0   else 1.0
+        # classUID at payload[0:8]; scalar params at [8..28]; curve data (Points UID) follows
+        min_sp  = f32(8);  min_sp  = min_sp  if 0.0 <= min_sp  <= 1000.0 else 0.7
+        max_sp  = f32(12); max_sp  = max_sp  if 0.0 <= max_sp  <= 1000.0 else 9.5
+        vol_atm = f32(16); vol_atm = vol_atm if abs(vol_atm)   <= 100.0  else 3.0
+        sp_atmv = f32(20); sp_atmv = sp_atmv if 0.0 < sp_atmv  <= 1000.0 else 12.0
+        pit_par = f32(24); pit_par = pit_par if abs(pit_par)   <= 1000.0 else 10.0
         return {
-            'Speed':      [0.0,   0.0, sp_max * 1.5, 0.1],
-            'Vol Scale':  [vol_sc, 0.0, 5.0,  0.01],
-            'Max Vol':    [max_vol, 0.0, 1.0, 0.05],
-            'Min Pitch':  [min_p,  0.1, 2.0,  0.05],
-            'Max Pitch':  [max_p,  0.1, 4.0,  0.05],
+            'Speed':         [0.0,     0.0,   sp_atmv * 2.0, 0.1],
+            'MinSpeed':      [min_sp,  0.0,   500.0,   0.1],
+            'MaxSpeed':      [max_sp,  0.0,   500.0,   0.1],
+            'VolAtMax':      [vol_atm, 0.0,   20.0,    0.1],
+            'SpeedAtMaxVol': [sp_atmv, 0.01,  500.0,   0.1],
+            'PitchParam':    [pit_par, 0.0,   1000.0,  0.1],
         }
 
     elif class_name == 'RandomSound':
         return {}
 
     elif class_name == 'TankSound':
-        max_rpm   = f32(16); max_rpm   = max_rpm   if 10.0 <= max_rpm   <= 10000.0 else 500.0
-        base_pit  = f32(24); base_pit  = base_pit  if 0.1  <= base_pit  <= 2.0     else 0.95
-        idle_vol  = f32(40); idle_vol  = idle_vol  if 0.0  <  idle_vol  <= 1.0     else 0.8
+        # classUID at payload[0:8]; floats at payload[8..60] (13 floats)
+        max_rpm  = f32(16); max_rpm  = max_rpm  if 10.0 <= max_rpm  <= 10000.0 else 500.0
+        base_pit = f32(24); base_pit = base_pit if 0.1  <= base_pit <= 2.0     else 0.95
+        idle_vol = f32(40); idle_vol = idle_vol if 0.0  <  idle_vol <= 1.0     else 0.8
         return {
-            'RPM':        [0.0,      0.0, max_rpm, 5.0],
-            'Base Pitch': [base_pit, 0.5, 2.0,     0.01],
-            'Idle Vol':   [idle_vol, 0.0, 1.0,     0.05],
+            'RPM':       [0.0,       0.0,   max_rpm,  5.0],
+            'MaxRPM':    [max_rpm,   10.0,  10000.0, 10.0],
+            'BasePitch': [base_pit,  0.1,   2.0,     0.01],
+            'IdleVol':   [idle_vol,  0.0,   1.0,     0.01],
+            'Unk[8]':    [f32(8),    0.0,   1000.0,  1.0],
+            'Unk[12]':   [f32(12),   0.0,   1000.0,  1.0],
+            'Unk[20]':   [f32(20),   0.0,   2.0,     0.01],
+            'Unk[28]':   [f32(28),   0.0,   2.0,     0.01],
+            'Unk[32]':   [f32(32),   0.0,   2.0,     0.01],
+            'Unk[36]':   [f32(36),   0.0,   2.0,     0.01],
+            'Unk[44]':   [f32(44),   0.0,   1.0,     0.01],
+            'Unk[48]':   [f32(48),   0.0,   1.0,     0.001],
+            'Unk[52]':   [f32(52),   0.0,   1.0,     0.01],
+            'Unk[56]':   [f32(56),   0.0,   50.0,    0.1],
+        }
+
+    elif class_name == 'ReverbSetting':
+        # payload: u32=1 at [0:4], u8=0x3F at [4], then 23 f32s starting at [5]
+        _RL = ['PreDelay', 'RoomSize', 'DecayTime', 'HF_Ref', 'HF_Decay',
+               'Density', 'Diffusion', 'ER_Level', 'ER_Delay', 'ER_Band',
+               'LateReverb', 'LateLevel', 'LateBand', 'LateDelay', 'LateWidth',
+               'MixDry', 'MixWet', 'Band_Low', 'Band_Mid', 'Band_High',
+               'Modulation', 'ModDepth', 'ModRate']
+        _RR = [(0.0,0.5,0.001),(0.0,1.0,0.01),(0.1,20.0,0.1),(0.1,1.0,0.01),(0.0,1.0,0.01),
+               (0.0,1.0,0.01),(0.0,1.0,0.01),(0.0,20.0,0.1),(0.0,200.0,1.0),(0.0,1.0,0.01),
+               (0.0,1.0,0.01),(0.0,2.0,0.01),(0.0,1.0,0.01),(0.0,200.0,1.0),(0.0,180.0,1.0),
+               (0.0,1.0,0.01),(0.0,1.0,0.01),(0.0,1.0,0.01),(0.0,1.0,0.01),(0.0,1.0,0.01),
+               (0.0,1.0,0.01),(0.0,1.0,0.01),(0.0,10.0,0.01)]
+        result = {}
+        for i, (lbl, (mn, mx, step)) in enumerate(zip(_RL, _RR)):
+            v = f32(5 + i * 4)
+            v = v if (v == v and mn - 0.5 <= v <= mx + 0.5) else (mn + mx) / 2
+            result[lbl] = [v, mn, mx, step]
+        return result
+
+    elif class_name == 'CompLimitSetting':
+        # payload: u8 mode at [0], then 8 f32s starting at [1]
+        _CL = ['Threshold', 'Ratio', 'Attack_ms', 'Release_s',
+               'Attack2_ms', 'MakeupGain', 'Knee', 'Unk[7]']
+        _CR = [(0.0,1.0,0.01),(0.0,1.0,0.01),(0.0,0.01,0.0001),(0.0,10.0,0.1),
+               (0.0,0.1,0.001),(0.0,2.0,0.01),(0.0,1.0,0.01),(-10.0,10.0,0.01)]
+        result = {}
+        for i, (lbl, (mn, mx, step)) in enumerate(zip(_CL, _CR)):
+            v = f32(1 + i * 4)
+            result[lbl] = [v, mn, mx, step]
+        return result
+
+    elif class_name == 'GasMaskSound':
+        # classUID at payload[0:8]; u32=0 at [8:12]; floats at [12..]
+        vol_v  = f32(12); vol_v  = vol_v  if 0.0 <= vol_v  <= 2.0   else 1.0
+        near_v = f32(16); near_v = near_v if 0.0 <= near_v <= 500.0 else 5.0
+        far_v  = f32(20); far_v  = far_v  if 0.0 <= far_v  <= 500.0 else 30.0
+        return {
+            'Volume':   [vol_v,   0.0, 2.0,     0.01],
+            'NearDist': [near_v,  0.0, 100.0,   0.5],
+            'FarDist':  [far_v,   0.0, 200.0,   1.0],
+            'Unk[24]':  [f32(24), 0.0, 200.0,   0.1],
+            'DSP_Freq': [f32(28), 0.0, 24000.0, 10.0],
+            'DSP_Q':    [f32(32), 0.0, 10.0,    0.01],
+            'DSP_Wet':  [f32(36), 0.0, 1.0,     0.01],
         }
 
     return {}
 
 
 # Config classes whose slider changes can be written back to the binary
-_PARAM_WRITABLE_CLASSES = frozenset({'BasicSoundII'})
+_PARAM_WRITABLE_CLASSES = frozenset({
+    'BasicSoundII',
+    'TankSound', 'PhysicsSoundLoop', 'GasMaskSound',
+    'ReverbSetting', 'CompLimitSetting',
+})
 
-# Slider label -> index in the float block immediately after the bus-path string
+# Slider label -> index in the float block immediately after the bus-path string (BasicSoundII only)
 _BASIC_SOUND_FLOAT_IDX = {
     'Volume':      0,
     'Near Dist':   3,
@@ -687,6 +936,42 @@ _BASIC_SOUND_FLOAT_IDX = {
     'Pitch Scale': 5,
     'Pitch Low':   6,
     'Pitch High':  7,
+}
+
+# Slider label -> byte offset from payload start (i.e. from end of string table)
+# Used by the generic _write_config_params for all non-BasicSoundII writable classes.
+_PARAM_FLOAT_OFFSETS: dict[str, dict[str, int]] = {
+    'TankSound': {
+        # classUID at payload[0:8]; floats start at payload[8]
+        'Unk[8]':    8,   'Unk[12]':  12,  'MaxRPM':    16,  'Unk[20]':  20,
+        'BasePitch': 24,  'Unk[28]':  28,  'Unk[32]':   32,  'Unk[36]':  36,
+        'IdleVol':   40,  'Unk[44]':  44,  'Unk[48]':   48,  'Unk[52]':  52,
+        'Unk[56]':   56,
+    },
+    'PhysicsSoundLoop': {
+        # classUID at payload[0:8]; floats at payload[8..28]; curve data follows
+        'MinSpeed':      8,  'MaxSpeed':      12,  'VolAtMax':     16,
+        'SpeedAtMaxVol': 20, 'PitchParam':    24,
+    },
+    'GasMaskSound': {
+        # classUID at payload[0:8]; u32=0 at [8:12]; floats at [12..]
+        'Volume':   12, 'NearDist': 16, 'FarDist':  20,
+        'Unk[24]':  24, 'DSP_Freq': 28, 'DSP_Q':    32, 'DSP_Wet':  36,
+    },
+    'ReverbSetting': {
+        # payload: u32=1 at [0:4], u8=0x3F at [4], then 23 f32s starting at [5]
+        'PreDelay':   5,  'RoomSize':   9,  'DecayTime':  13, 'HF_Ref':     17,
+        'HF_Decay':   21, 'Density':    25, 'Diffusion':  29, 'ER_Level':   33,
+        'ER_Delay':   37, 'ER_Band':    41, 'LateReverb': 45, 'LateLevel':  49,
+        'LateBand':   53, 'LateDelay':  57, 'LateWidth':  61, 'MixDry':     65,
+        'MixWet':     69, 'Band_Low':   73, 'Band_Mid':   77, 'Band_High':  81,
+        'Modulation': 85, 'ModDepth':   89, 'ModRate':    93,
+    },
+    'CompLimitSetting': {
+        # payload: u8 mode at [0], then 8 f32s starting at [1]
+        'Threshold':   1,  'Ratio':       5,  'Attack_ms':   9,  'Release_s':  13,
+        'Attack2_ms': 17,  'MakeupGain': 21,  'Knee':       25,  'Unk[7]':     29,
+    },
 }
 
 
@@ -712,6 +997,23 @@ def _write_basic_sound_params(chunk_own: bytes, be: bool, params: dict) -> bytes
             abs_off = payload_off + block_start + blk_idx * 4
             if abs_off + 4 <= len(data):
                 struct.pack_into(fmt_f, data, abs_off, float(params[label]))
+    return bytes(data)
+
+
+def _write_config_params(chunk_own: bytes, be: bool, class_name: str, params: dict) -> bytes:
+    """
+    Generic write-back for config classes that store floats at fixed payload offsets.
+    Payload offset = byte offset from start of payload (i.e. from end of string table).
+    """
+    payload_off = _skip_strtable(chunk_own, be)
+    offsets     = _PARAM_FLOAT_OFFSETS.get(class_name, {})
+    fmt_f       = '>f' if be else '<f'
+    data        = bytearray(chunk_own)
+    for label, val in params.items():
+        if label in offsets:
+            abs_off = payload_off + offsets[label]
+            if abs_off + 4 <= len(data):
+                struct.pack_into(fmt_f, data, abs_off, float(val))
     return bytes(data)
 
 
@@ -743,6 +1045,8 @@ class AudioTrack:
         self.file_offset = 0   # byte offset of chunk header in the raw file
         self.chunk_ds    = 0   # data_size from chunk header (12 + len(own))
         self.chunk_ts    = 0   # total_size from chunk header (= chunk_ds for these leafs)
+        # v6: dialogue data
+        self.dialogue_data = None  # dict for AudioDialogueSequence / AudioDialoguePersonality
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -766,6 +1070,9 @@ _CONFIG_CLASSES = {
     'SubsonicSound':         'SubSonic',
     'AmbientVehicleSound':   'AmbVehicle',
     'Sequence':              'Sequence',
+    # Dialogue types (view & redact)
+    'AudioDialogueSequence':    'DlgSeq',
+    'AudioDialoguePersonality': 'DlgPers',
     # New metadata-only types
     'MaterialMap':           'MatMap',
     'ReverbSetting':         'Reverb',
@@ -959,10 +1266,23 @@ def _get_config_display(data, class_name, be):
         return lines if lines else [f"  {s}" for s in strs]
 
     elif class_name == 'AudioSoundGroups':
-        strs = scan_strings(4)
-        routing = {'sound_groups', 'surround'}
-        groups = [s for s in strs if s not in routing and not s.startswith('\\')]
-        return [f"  {s}" for s in groups] if groups else ['(no groups found)']
+        # Binary: u8=0 + u32=5 header, then entries: 8B UID + 0x01 + u32+name+null + u32 max_voices + u32 priority + u32
+        lines = []
+        pos = 5  # skip u8 + u32 header
+        while pos + 13 < len(payload):
+            uid = payload[pos:pos+8]; pos += 8
+            if pos >= len(payload) or payload[pos] != 0x01: break
+            pos += 1
+            if pos + 4 > len(payload): break
+            name_len = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            if name_len == 0 or name_len > 256 or pos + name_len + 1 > len(payload): break
+            name = payload[pos:pos+name_len].decode('ascii', errors='replace'); pos += name_len + 1
+            if pos + 12 > len(payload): break
+            max_v = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            prio  = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            unk   = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            lines.append(f"  {name:<30}  voices={max_v}  prio={prio}  u={unk}")
+        return lines if lines else ['(no groups found — check binary format)']
 
     elif class_name == 'DialogueSoundGroups':
         strs = scan_strings(4)
@@ -974,49 +1294,61 @@ def _get_config_display(data, class_name, be):
         return [f"  {s}" for s in unique] if unique else ['(no groups)']
 
     elif class_name == 'ReverbSetting':
-        strs = scan_strings(4)
-        return [f"  Preset: {s}" for s in strs[:3]] if strs else ['  (no preset name)']
+        # Params are shown in the sliders panel; just display the version/type header.
+        lines = []
+        if len(payload) >= 5:
+            ver  = struct.unpack_from('<I', payload, 0)[0]
+            typ  = payload[4]
+            lines.append(f"  Version={ver}  TypeByte=0x{typ:02X}")
+            lines.append(f"  23 f32 parameters — edit above in Sliders panel")
+        return lines if lines else ['  (no payload)']
 
     elif class_name == 'CompLimitSetting':
-        strs = scan_strings(4)
-        lines = [f"  Mode: {strs[0]}"] if strs else []
-        for i in range(min(12, len(payload)//4)):
-            v = struct.unpack_from('<f', payload, i*4)[0]
-            if v == v and 1e-5 <= abs(v) <= 1e5:
-                lines.append(f"  [{i:2d}] = {v:.5f}")
-        return lines[:10] if lines else ['(no params)']
+        # Params are shown in the sliders panel; just display the mode byte.
+        lines = []
+        if len(payload) >= 1:
+            mode = payload[0]
+            lines.append(f"  Mode byte=0x{mode:02X}  (0xF0 = standard)")
+            lines.append(f"  8 f32 parameters — edit above in Sliders panel")
+        return lines if lines else ['  (no payload)']
 
     elif class_name == 'AudioMemoryBudget':
-        strs = scan_strings(4)
-        routing = {'MemoryBudget'}
-        cats = [s for s in strs if s not in routing]
-        lines = []
-        float_vals = []
-        for i in range(min(30, len(payload)//4)):
-            v = struct.unpack_from('<f', payload, i*4)[0]
-            if v == v and 1.0 <= v <= 1e6:
-                float_vals.append(v)
-        for j, cat in enumerate(cats):
-            val = float_vals[j] if j < len(float_vals) else None
-            if val is not None:
-                lines.append(f"  {cat:<12} : {val:.0f} KB")
-            else:
-                lines.append(f"  {cat}")
+        # Binary: u32 hash[0:4] + u32 count[4:8] + entries
+        if len(payload) < 8: return ['(empty)']
+        hash_val = struct.unpack_from('<I', payload, 0)[0]
+        count    = struct.unpack_from('<I', payload, 4)[0]
+        if count > 100: return [f'  (invalid count={count})']
+        lines = [f"  Schema: 0x{hash_val:08X}  |  {count} categories"]
+        pos = 8
+        for _ in range(count):
+            if pos + 8 > len(payload): break
+            pos += 8  # skip UID
+            if pos + 4 > len(payload): break
+            name_len = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            if name_len == 0 or name_len > 256 or pos + name_len + 1 > len(payload): break
+            name = payload[pos:pos+name_len].decode('ascii', errors='replace'); pos += name_len + 1
+            if pos + 12 > len(payload): break
+            bud1 = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            bud2 = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            unk  = struct.unpack_from('<I', payload, pos)[0]; pos += 4
+            lines.append(f"  {name:<12} : {bud1//1024}K primary / {bud2//1024}K residual")
         return lines if lines else ['(no budget data)']
 
     elif class_name == 'SideChain':
-        strs = scan_strings(4)
-        return [f"  Chain: {s}" for s in strs[:3]] if strs else ['  SideChain config']
+        lines = []
+        if len(payload) >= 8:
+            h = struct.unpack_from('<I', payload, 0)[0]
+            z = struct.unpack_from('<I', payload, 4)[0]
+            lines.append(f"  Schema hash: 0x{h:08X}  reserved: 0x{z:08X}")
+        lines.append("  Payload: 8 bytes (config referenced by name from Mixer)")
+        return lines
 
     elif class_name == 'GasMaskSound':
-        groups = _read_string_table(data, be)
-        obj_name = ''
-        for gname, items in groups:
-            if items: obj_name = items[0]; break
+        # Params shown in sliders panel; just show role info.
         return [
-            f"  Applies muffled/filtered effect to VO dialogue",
-            f"  Object: '{obj_name}'",
-            f"  Bus: \\master\\vo\\peds",
+            "  VO gas-mask DSP filter for dialogue",
+            "  Bus: \\master\\vo\\peds",
+            "  Parameters (Vol/Near/Far/DSP) shown in Sliders panel above",
         ]
 
     elif class_name == 'Mixer':
@@ -1051,6 +1383,10 @@ def _detect_config(chunk_data, big_endian):
     t.config_refs    = _parse_config_refs(chunk_data, class_name, big_endian)
     t.config_params  = _parse_config_params(chunk_data, class_name, big_endian)
     t.config_display = _get_config_display(chunk_data, class_name, big_endian)
+    if class_name == 'AudioDialogueSequence':
+        t.dialogue_data = _parse_dialogue_sequence_data(chunk_data, big_endian)
+    elif class_name == 'AudioDialoguePersonality':
+        t.dialogue_data = _parse_dialogue_personality_data(chunk_data, big_endian)
     return t
 
 
@@ -1263,18 +1599,16 @@ def play_simulated(track: AudioTrack, all_tracks: list,
                                     f"Physics3V '{track.names[0]}'  vel={vel:.0f}  vol={vol:.2f}  ->'{name}'")
 
             elif cls == 'PhysicsSoundLoop':
-                speed    = float(param_vals.get('Speed',     5.0))
-                vol_sc   = float(param_vals.get('Vol Scale', 0.25))
-                max_vol  = float(param_vals.get('Max Vol',   1.0))
-                min_p    = float(param_vals.get('Min Pitch', 0.32))
-                max_p    = float(param_vals.get('Max Pitch', 1.0))
-                # speed_at_max from params definition
-                sp_max_cfg = track.config_params.get('Speed', [0, 0, 20, 0])
-                sp_max = sp_max_cfg[2] / 1.5  # stored as sp_max*1.5
-                sp_max = max(sp_max, 0.1)
-                t_norm  = min(1.0, speed / sp_max)
-                vol     = min(max_vol, speed * vol_sc)
-                pitch   = min_p + t_norm * (max_p - min_p)
+                speed    = float(param_vals.get('Speed',         5.0))
+                min_sp   = float(param_vals.get('MinSpeed',      0.7))
+                sp_atmv  = float(param_vals.get('SpeedAtMaxVol', 12.0))
+                # Linear vol: 0.0 below MinSpeed, 1.0 at SpeedAtMaxVol
+                if speed <= min_sp:
+                    vol = 0.0
+                else:
+                    vol = min(1.0, (speed - min_sp) / max(sp_atmv - min_sp, 0.01))
+                # Approximate pitch rise from 0.5 to 1.0 with volume
+                pitch = 0.5 + 0.5 * vol
                 audio_refs = [n for r, n in track.config_refs if r == 'audio']
                 if not audio_refs:
                     if status_cb: status_cb("PhysicsSoundLoop: no audio ref found.")
@@ -1311,11 +1645,10 @@ def play_simulated(track: AudioTrack, all_tracks: list,
                                     f"RandomSnd '{track.names[0]}' ->'{name}'")
 
             elif cls == 'TankSound':
-                rpm      = float(param_vals.get('RPM',        100.0))
-                base_p   = float(param_vals.get('Base Pitch', 0.95))
-                idle_v   = float(param_vals.get('Idle Vol',   0.8))
-                max_rpm_cfg = track.config_params.get('RPM', [0, 0, 500, 0])
-                max_rpm  = max_rpm_cfg[2]
+                rpm      = float(param_vals.get('RPM',       100.0))
+                base_p   = float(param_vals.get('BasePitch', 0.95))
+                idle_v   = float(param_vals.get('IdleVol',   0.8))
+                max_rpm  = float(param_vals.get('MaxRPM',   500.0))
                 t_norm   = min(1.0, rpm / max(max_rpm, 1.0))
                 vol      = idle_v + t_norm * (1.0 - idle_v)
                 pitch    = base_p + t_norm * 0.6  # pitch rises ~0.6× from idle to redline
@@ -1516,13 +1849,15 @@ def _rebuild_mp3_own(chunk_own: bytes, mp3_bytes: bytes) -> bytes:
 
 def _import_type_hint(track: 'AudioTrack') -> str:
     if track.codec == 'adpcm':
-        return f"RADP IMA-ADPCM  {track.channels}ch  {track.sample_rate} Hz"
+        return (f"RADP IMA-ADPCM  {track.channels}ch  "
+                f"[sample rate from WAV — original was {track.sample_rate} Hz]")
     if track.codec == 'pcm_wav':
-        return f"PCM WAV  {track.channels}ch  {track.sample_rate} Hz"
+        return (f"PCM WAV  {track.channels}ch  "
+                f"[sample rate from WAV — original was {track.sample_rate} Hz]")
     if track.codec == 'mp3':
         return "MPEG-1 MP3 (PS3) — import .mp3 directly; other formats need pydub"
     if track.codec == 'empty':
-        return "New chunk — will create RADP IMA-ADPCM 1ch 48000 Hz"
+        return "New chunk — RADP IMA-ADPCM, channels and rate from source WAV"
     return ""
 
 
@@ -1575,10 +1910,9 @@ def import_audio(track: 'AudioTrack', source_path: str):
 
     # ── 2. Convert and rebuild ─────────────────────────────────
     if track.codec == 'adpcm':
-        dst_ch = track.channels
-        dst_sr = track.sample_rate
-        pcm2 = _resample_pcm(pcm, src_sr, dst_sr, src_ch)
-        pcm3 = _convert_channels_pcm(pcm2, src_ch, dst_ch)
+        dst_ch = track.channels          # keep original channel layout (multi-voice safe)
+        dst_sr = src_sr                  # use source sample rate — no resampling needed
+        pcm3 = _convert_channels_pcm(pcm, src_ch, dst_ch)
         n_aligned = (len(pcm3) // dst_ch // _IMA_SAMPS) * _IMA_SAMPS * dst_ch
         pcm3 = array.array('h', pcm3[:n_aligned])
         if not pcm3:
@@ -1593,10 +1927,9 @@ def import_audio(track: 'AudioTrack', source_path: str):
                      f"({len(adpcm) // 1024} KB ADPCM)")
 
     elif track.codec == 'pcm_wav':
-        dst_ch = track.channels
-        dst_sr = track.sample_rate
-        pcm2 = _resample_pcm(pcm, src_sr, dst_sr, src_ch)
-        pcm3 = _convert_channels_pcm(pcm2, src_ch, dst_ch)
+        dst_ch = track.channels          # keep original channel layout
+        dst_sr = src_sr                  # use source sample rate
+        pcm3 = _convert_channels_pcm(pcm, src_ch, dst_ch)
         try:
             own = _rebuild_pcmwav_own(track.chunk_own, pcm3, dst_ch, dst_sr)
         except Exception as e:
@@ -1618,17 +1951,16 @@ def import_audio(track: 'AudioTrack', source_path: str):
                      "Convert to WAV first, or import an .mp3 directly.")
 
     elif track.codec == 'empty':
-        # New chunk: encode as RADP IMA-ADPCM 1ch 48000 Hz
-        dst_ch = 1
-        dst_sr = 48000
-        pcm2 = _resample_pcm(pcm, src_sr, dst_sr, src_ch)
-        pcm3 = _convert_channels_pcm(pcm2, src_ch, dst_ch)
+        # New chunk: encode as RADP IMA-ADPCM using source channels and sample rate
+        dst_ch = min(src_ch, 3)  # game supports up to 3-voice
+        dst_sr = src_sr          # use source sample rate directly
+        pcm3 = _convert_channels_pcm(pcm, src_ch, dst_ch)
         n_aligned = (len(pcm3) // dst_ch // _IMA_SAMPS) * _IMA_SAMPS * dst_ch
         pcm3 = array.array('h', pcm3[:n_aligned])
         if not pcm3:
             return b'', "Audio too short (need >= 32 samples per channel)."
         adpcm = encode_adpcm(pcm3, dst_ch)
-        # Build from scratch using the existing string table prefix
+        # Build RADP from scratch appended to the existing string table prefix
         new_radp = (b'RADP' +
                     struct.pack('<IIII', dst_ch, dst_sr, 10, len(adpcm)) +
                     adpcm)
@@ -1706,6 +2038,8 @@ def _tag_for(track):
             'SubsonicSound':         'cfg_sub',
             'AmbientVehicleSound':   'cfg_ambveh',
             'Sequence':              'cfg_seq',
+            'AudioDialogueSequence':    'cfg_dlgseq',
+            'AudioDialoguePersonality': 'cfg_dlgpers',
             'MaterialMap':           'cfg_matmap',
             'ReverbSetting':         'cfg_reverb',
             'CompLimitSetting':      'cfg_comp',
@@ -1740,7 +2074,7 @@ _COL_BG    = '#F4F4F6'
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Radical Sound Exporter  v4")
+        self.title("Radical Sound Exporter  v5")
         self.geometry("960x700")
         self.minsize(720, 500)
         self.configure(bg=_COL_BG)
@@ -1816,6 +2150,9 @@ class App(tk.Tk):
         self._tv.tag_configure('cfg_sub',    foreground='#0D2D50', background='#DCE8F7')
         self._tv.tag_configure('cfg_ambveh', foreground='#404000', background='#F5F5DC')
         self._tv.tag_configure('cfg_seq',    foreground='#4A3000', background='#FFF8DC')
+        # Color tags — dialogue types
+        self._tv.tag_configure('cfg_dlgseq',  foreground='#6A0010', background='#FAE8E0')
+        self._tv.tag_configure('cfg_dlgpers', foreground='#4A0020', background='#F5E0DC')
         # Color tags — metadata-only types
         self._tv.tag_configure('cfg_matmap', foreground='#3A2010', background='#F5EDE0')
         self._tv.tag_configure('cfg_reverb', foreground='#202040', background='#EBEBF5')
@@ -1897,14 +2234,15 @@ class App(tk.Tk):
         cls   = track.config_class
         label = _CONFIG_CLASSES.get(cls, cls)
         color_map = {
-            'cfg_basic':  '#7A3800', 'cfg_dual':   '#006060',
-            'cfg_phys3':  '#3A5800', 'cfg_physlp': '#7A6000',
-            'cfg_random': '#780050', 'cfg_tank':   '#7A2000',
-            'cfg_amb2':   '#004080', 'cfg_sub':    '#0D2D50',
-            'cfg_ambveh': '#404000', 'cfg_seq':    '#4A3000',
-            'cfg_matmap': '#3A2010', 'cfg_reverb': '#202040',
-            'cfg_comp':   '#201040', 'cfg_meta':   '#404040',
-            'cfg_mixer':  '#2A2A2A',
+            'cfg_basic':   '#7A3800', 'cfg_dual':    '#006060',
+            'cfg_phys3':   '#3A5800', 'cfg_physlp':  '#7A6000',
+            'cfg_random':  '#780050', 'cfg_tank':    '#7A2000',
+            'cfg_amb2':    '#004080', 'cfg_sub':     '#0D2D50',
+            'cfg_ambveh':  '#404000', 'cfg_seq':     '#4A3000',
+            'cfg_matmap':  '#3A2010', 'cfg_reverb':  '#202040',
+            'cfg_comp':    '#201040', 'cfg_meta':    '#404040',
+            'cfg_mixer':   '#2A2A2A',
+            'cfg_dlgseq':  '#6A0010', 'cfg_dlgpers': '#4A0020',
         }
         fg = color_map.get(_tag_for(track), '#333333')
         self._cfg_panel.config(
@@ -2072,6 +2410,13 @@ class App(tk.Tk):
                          font=('Consolas', 8), anchor='w', justify='left'
                          ).pack(fill='x', padx=2)
 
+        # ── Dialogue data section ──
+        if track.dialogue_data is not None:
+            if track.config_class == 'AudioDialogueSequence':
+                self._build_dialogue_seq_panel(track)
+            elif track.config_class == 'AudioDialoguePersonality':
+                self._build_dialogue_pers_panel(track)
+
         # ── Simulate Play button (only for types with audio refs) ──
         if track.config_refs:
             sim_row = tk.Frame(self._cfg_panel, bg=_COL_BG)
@@ -2087,6 +2432,211 @@ class App(tk.Tk):
             tk.Label(sim_row,
                      text="Plays the referenced audio with the parameters above applied.",
                      bg=_COL_BG, fg='#666677', font=('Segoe UI', 8)).pack(side='left')
+
+    # ─── dialogue panels ──────────────────────────────────────
+
+    def _build_dialogue_seq_panel(self, track: AudioTrack):
+        """Build editable AudioDialogueSequence panel inside self._cfg_panel."""
+        dd      = track.dialogue_data
+        entries = dd.get('entries', [])
+
+        lf = tk.LabelFrame(self._cfg_panel, text=" Dialogue Sequence ",
+                           bg=_COL_BG, font=('Segoe UI', 8))
+        lf.pack(fill='x', padx=4, pady=(2, 2))
+
+        # Header row: scene name + entry count
+        hdr = tk.Frame(lf, bg=_COL_BG)
+        hdr.pack(fill='x', padx=6, pady=(4, 0))
+        tk.Label(hdr, text=f"Scene:  {dd.get('scene_name', '')}",
+                 bg=_COL_BG, fg='#333344', font=('Consolas', 8), anchor='w').pack(side='left')
+        tk.Label(hdr, text=f"   |   {len(entries)} entries",
+                 bg=_COL_BG, fg='#666688', font=('Segoe UI', 8)).pack(side='left')
+
+        # Bus name row (editable)
+        bus_row = tk.Frame(lf, bg=_COL_BG)
+        bus_row.pack(fill='x', padx=6, pady=(2, 4))
+        tk.Label(bus_row, text="Bus:", bg=_COL_BG, fg='#333344',
+                 font=('Segoe UI', 8), width=5, anchor='e').pack(side='left')
+        bus_var = tk.StringVar(value=dd.get('bus_name', ''))
+        tk.Entry(bus_row, textvariable=bus_var, font=('Consolas', 8),
+                 bg='#FFFFF0', fg='#222222', relief='solid', bd=1,
+                 width=36).pack(side='left', padx=4)
+
+        # Entries table
+        entry_af_vars: list = []
+        if entries:
+            ch = tk.Frame(lf, bg=_COL_BG)
+            ch.pack(fill='x', padx=6, pady=(0, 2))
+            tk.Label(ch, text="Personality", bg=_COL_BG, fg='#556677',
+                     font=('Segoe UI', 8, 'bold'), width=30, anchor='w').grid(
+                     row=0, column=0, sticky='w')
+            tk.Label(ch, text="AudioFile  (editable)", bg=_COL_BG, fg='#556677',
+                     font=('Segoe UI', 8, 'bold'), width=30, anchor='w').grid(
+                     row=0, column=1, sticky='w', padx=(4, 0))
+
+            cap     = 200
+            visible = entries[:cap]
+            h       = min(160, 18 * len(visible) + 4)
+            canvas  = tk.Canvas(lf, bg=_COL_BG, highlightthickness=0, height=h)
+            vsb     = ttk.Scrollbar(lf, orient='vertical', command=canvas.yview)
+            canvas.configure(yscrollcommand=vsb.set)
+            vsb.pack(side='right', fill='y')
+            canvas.pack(side='left', fill='both', expand=True, padx=(6, 0))
+            frm = tk.Frame(canvas, bg=_COL_BG)
+            canvas.create_window((0, 0), window=frm, anchor='nw')
+            frm.bind('<Configure>', lambda e, c=canvas: c.configure(scrollregion=c.bbox('all')))
+
+            for row_i, e in enumerate(visible):
+                row_bg = '#FFFFFF' if row_i % 2 == 0 else '#F8F8FC'
+                tk.Label(frm, text=e['pers_name'], bg=row_bg, fg='#333344',
+                         font=('Consolas', 8), width=30, anchor='w').grid(
+                         row=row_i, column=0, sticky='w', pady=1)
+                var = tk.StringVar(value=e['af_name'])
+                entry_af_vars.append(var)
+                tk.Entry(frm, textvariable=var, font=('Consolas', 8),
+                         bg='#FFFFF0', fg='#222222', relief='solid', bd=1,
+                         width=32).grid(row=row_i, column=1, sticky='w',
+                                        padx=(4, 0), pady=1)
+
+            if len(entries) > cap:
+                tk.Label(frm,
+                         text=f"  ... ({len(entries) - cap} more entries not shown)",
+                         bg=_COL_BG, fg='#888888', font=('Segoe UI', 8)).grid(
+                         row=len(visible), column=0, columnspan=2, sticky='w', pady=2)
+
+        else:
+            tk.Label(lf, text="  (no entries)", bg=_COL_BG, fg='#888888',
+                     font=('Segoe UI', 8)).pack(padx=6, pady=2)
+
+        # Apply button
+        btn_row = tk.Frame(lf, bg=_COL_BG)
+        btn_row.pack(fill='x', padx=6, pady=(4, 6))
+
+        def _apply_seq(t=track, bv=bus_var, evars=entry_af_vars, ents=entries):
+            new_bus  = bv.get().strip()
+            new_ents = []
+            for i, e in enumerate(ents):
+                new_af = evars[i].get().strip() if i < len(evars) else e['af_name']
+                new_ents.append(dict(e, af_name=new_af))
+            sel_name = t.names[0] if t.names else None
+            try:
+                new_own = _rebuild_dialogue_sequence_chunk(
+                    t.chunk_own, t.big_endian, new_bus, new_ents)
+                new_raw = replace_chunk_in_p3d(
+                    self._raw, t.file_offset, t.chunk_ts, new_own, self._be)
+                self._raw      = new_raw
+                self._modified = True
+                self._update_title_modified()
+                self._reload_from_raw()
+                if sel_name and sel_name in self._name_to_idx:
+                    idx = self._name_to_idx[sel_name]
+                    self._tv.selection_set(str(idx))
+                    self._tv.see(str(idx))
+                    self._on_select(None)
+                self._set_status("Dialogue sequence updated — Ctrl+S to save.")
+            except Exception as ex:
+                self._set_status(f"Apply error: {ex}")
+
+        tk.Button(btn_row, text="Apply Changes", command=_apply_seq,
+                  bg='#2A5A3A', fg=_FG_WHITE, relief='flat',
+                  font=('Segoe UI', 8, 'bold'), cursor='hand2',
+                  padx=6, pady=2).pack(side='left')
+
+    def _build_dialogue_pers_panel(self, track: AudioTrack):
+        """Build editable AudioDialoguePersonality panel inside self._cfg_panel."""
+        dd      = track.dialogue_data
+        entries = dd.get('entries', [])
+
+        lf = tk.LabelFrame(self._cfg_panel, text=" Dialogue Personality ",
+                           bg=_COL_BG, font=('Segoe UI', 8))
+        lf.pack(fill='x', padx=4, pady=(2, 2))
+
+        # Name row (editable)
+        name_row = tk.Frame(lf, bg=_COL_BG)
+        name_row.pack(fill='x', padx=6, pady=(4, 2))
+        tk.Label(name_row, text="Name:", bg=_COL_BG, fg='#333344',
+                 font=('Segoe UI', 8), width=6, anchor='e').pack(side='left')
+        name_var = tk.StringVar(value=dd.get('own_name', ''))
+        tk.Entry(name_row, textvariable=name_var, font=('Consolas', 8),
+                 bg='#FFFFF0', fg='#222222', relief='solid', bd=1,
+                 width=38).pack(side='left', padx=4)
+        tk.Label(name_row, text=f"({len(entries)} conditions)",
+                 bg=_COL_BG, fg='#666688', font=('Segoe UI', 8)).pack(side='left')
+
+        # Condition table (read-only)
+        if entries:
+            ch = tk.Frame(lf, bg=_COL_BG)
+            ch.pack(fill='x', padx=6, pady=(4, 0))
+            for col, lbl, w in [(0, 'Condition', 24), (1, 'Bus Type', 22), (2, 'Mode', 10)]:
+                tk.Label(ch, text=lbl, bg=_COL_BG, fg='#556677',
+                         font=('Segoe UI', 8, 'bold'), width=w, anchor='w').grid(
+                         row=0, column=col, sticky='w')
+
+            cap     = 100
+            visible = entries[:cap]
+            h       = min(140, 18 * len(visible) + 4)
+            canvas  = tk.Canvas(lf, bg=_COL_BG, highlightthickness=0, height=h)
+            vsb     = ttk.Scrollbar(lf, orient='vertical', command=canvas.yview)
+            canvas.configure(yscrollcommand=vsb.set)
+            vsb.pack(side='right', fill='y')
+            canvas.pack(side='left', fill='both', expand=True, padx=(6, 0))
+            frm = tk.Frame(canvas, bg=_COL_BG)
+            canvas.create_window((0, 0), window=frm, anchor='nw')
+            frm.bind('<Configure>', lambda e, c=canvas: c.configure(scrollregion=c.bbox('all')))
+
+            for row_i, e in enumerate(visible):
+                row_bg = '#FFFFFF' if row_i % 2 == 0 else '#F8F8FC'
+                tk.Label(frm, text=e['cond'], bg=row_bg, fg='#333344',
+                         font=('Consolas', 8), width=24, anchor='w').grid(
+                         row=row_i, column=0, sticky='w', pady=1)
+                tk.Label(frm, text=e['bus'], bg=row_bg, fg='#334466',
+                         font=('Consolas', 8), width=22, anchor='w').grid(
+                         row=row_i, column=1, sticky='w', pady=1)
+                tk.Label(frm, text=e['mode'], bg=row_bg, fg='#443344',
+                         font=('Consolas', 8), width=10, anchor='w').grid(
+                         row=row_i, column=2, sticky='w', pady=1)
+
+            if len(entries) > cap:
+                tk.Label(frm, text=f"  ... ({len(entries) - cap} more)",
+                         bg=_COL_BG, fg='#888888', font=('Segoe UI', 8)).grid(
+                         row=len(visible), column=0, columnspan=3, sticky='w', pady=2)
+
+        else:
+            tk.Label(lf, text="  (no conditions)", bg=_COL_BG, fg='#888888',
+                     font=('Segoe UI', 8)).pack(padx=6, pady=2)
+
+        # Apply Name button
+        btn_row = tk.Frame(lf, bg=_COL_BG)
+        btn_row.pack(fill='x', padx=6, pady=(4, 6))
+
+        def _apply_name(t=track, nv=name_var):
+            new_name = nv.get().strip()
+            if not new_name:
+                self._set_status("Personality name cannot be empty.")
+                return
+            sel_name = t.names[0] if t.names else None
+            try:
+                new_own = _rebuild_dialogue_personality_name(
+                    t.chunk_own, t.big_endian, new_name)
+                new_raw = replace_chunk_in_p3d(
+                    self._raw, t.file_offset, t.chunk_ts, new_own, self._be)
+                self._raw      = new_raw
+                self._modified = True
+                self._update_title_modified()
+                self._reload_from_raw()
+                if sel_name and sel_name in self._name_to_idx:
+                    idx = self._name_to_idx[sel_name]
+                    self._tv.selection_set(str(idx))
+                    self._tv.see(str(idx))
+                    self._on_select(None)
+                self._set_status(f"Personality renamed to '{new_name}' — Ctrl+S to save.")
+            except Exception as ex:
+                self._set_status(f"Rename error: {ex}")
+
+        tk.Button(btn_row, text="Apply Name", command=_apply_name,
+                  bg='#2A3A5A', fg=_FG_WHITE, relief='flat',
+                  font=('Segoe UI', 8, 'bold'), cursor='hand2',
+                  padx=6, pady=2).pack(side='left')
 
     # ─── helpers ──────────────────────────────────────────────
 
@@ -2317,8 +2867,14 @@ class App(tk.Tk):
         """Called when a writable config-panel slider changes value."""
         if not self._raw or not track.file_offset:
             return
+        cls = track.config_class
         try:
-            new_own = _write_basic_sound_params(track.chunk_own, track.big_endian, params)
+            if cls == 'BasicSoundII':
+                new_own = _write_basic_sound_params(track.chunk_own, track.big_endian, params)
+            elif cls in _PARAM_FLOAT_OFFSETS:
+                new_own = _write_config_params(track.chunk_own, track.big_endian, cls, params)
+            else:
+                return
         except Exception:
             return
         # Patch float bytes in-place; chunk size is unchanged so no root resize needed
@@ -2334,7 +2890,7 @@ class App(tk.Tk):
             self._update_title_modified()
 
     def _update_title_modified(self):
-        title = "Radical Sound Exporter  v4"
+        title = "Radical Sound Exporter  v5"
         if self._modified:
             title += "  [MODIFIED — Ctrl+S to save]"
         self.title(title)
