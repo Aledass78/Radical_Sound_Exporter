@@ -1,5 +1,5 @@
 <sub>It is a fork of RockerLol's project, as it is based on his ideas in <a href="https://github.com/RockeyLol/Prototype-RADP-Conv-v1.0">Prototype-RADP-Conv-v1.0</a></sub>
-# Radical Sound Exporter  v4
+# Radical Sound Exporter
 
 Extracts, previews, exports, and imports audio in Prototype 2 `.p3d` files.
 Can also create new AudioFile chunks and inject them into an existing `.p3d`.  
